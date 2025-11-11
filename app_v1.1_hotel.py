@@ -181,7 +181,65 @@ def restore_auth_from_cookie():
     return False
 
 # 쿠키에서 인증 정보 복원 시도
-restore_auth_from_cookie()
+# st.context가 초기화되기 전에는 쿠키를 읽을 수 없으므로,
+# 여러 번 시도하거나 JavaScript를 사용
+restore_result = restore_auth_from_cookie()
+
+# st.context가 없고 쿠키 복원이 실패한 경우, JavaScript로 재시도
+# 운영 서버 환경 대응: URL 파라미터 방식 개선
+if not restore_result and not is_authenticated(st.session_state) and not st.session_state.get('_logout_in_progress', False):
+    # URL 파라미터에서 인증 정보 복원 (먼저 확인)
+    query_params = st.query_params
+    if 'auth_restore' in query_params:
+        admin_id = query_params['auth_restore']
+        if admin_id:
+            st.session_state.authenticated = True
+            st.session_state.admin_id = admin_id
+            if '_logout_in_progress' in st.session_state:
+                del st.session_state['_logout_in_progress']
+            # URL 파라미터 제거
+            st.query_params.clear()
+            try:
+                log_auth("INFO", "쿠키에서 인증 정보 복원 (JavaScript URL 파라미터)", admin_id=admin_id)
+            except:
+                pass
+            st.rerun()
+    else:
+        # URL 파라미터가 없으면 JavaScript로 쿠키 읽기 시도
+        # 새로고침 시 session_state가 초기화되므로, URL 파라미터로 체크
+        # 무한 리다이렉트 방지: URL에 auth_restore가 없을 때만 실행
+        cookie_read_script = """
+        <script>
+        (function() {
+            function getCookie(name) {
+                var nameEQ = name + "=";
+                var ca = document.cookie.split(';');
+                for(var i = 0; i < ca.length; i++) {
+                    var c = ca[i];
+                    while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+                    if (c.indexOf(nameEQ) == 0) {
+                        return c.substring(nameEQ.length, c.length);
+                    }
+                }
+                return null;
+            }
+            
+            // URL 파라미터에 auth_restore가 없고, 쿠키에 auth_admin_id가 있으면 리다이렉트
+            var urlParams = new URLSearchParams(window.location.search);
+            if (!urlParams.has('auth_restore')) {
+                var authId = getCookie("auth_admin_id");
+                if (authId) {
+                    // 리다이렉트 전에 약간의 지연 (Streamlit 렌더링 완료 대기)
+                    setTimeout(function() {
+                        var newUrl = window.location.pathname + "?auth_restore=" + encodeURIComponent(authId);
+                        window.location.href = newUrl;
+                    }, 50);
+                }
+            }
+        })();
+        </script>
+        """
+        st.components.v1.html(cookie_read_script, height=0)
 
 # 디버깅: 세션 상태 확인
 debug_info = {
@@ -235,31 +293,62 @@ if not is_auth_result:
                     # 쿠키에 인증 정보 저장 (새로고침 문제 해결)
                     # JavaScript를 사용하여 쿠키 설정 (서버 환경 대응)
                     admin_id = auth_result['admin_id']
-                    # 쿠키 설정 스크립트 (더 명확하게, 서버 환경 고려)
+                    # 쿠키 설정 스크립트 (운영 서버 환경 대응 강화)
                     cookie_script = f"""
                     <script>
-                    function setCookie(name, value, days) {{
-                        var expires = "";
-                        if (days) {{
-                            var date = new Date();
-                            date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
-                            expires = "; expires=" + date.toUTCString();
+                    (function() {{
+                        function setCookie(name, value, days) {{
+                            var expires = "";
+                            if (days) {{
+                                var date = new Date();
+                                date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+                                expires = "; expires=" + date.toUTCString();
+                            }}
+                            
+                            // 운영 서버 환경 대응: 도메인 자동 감지 및 설정
+                            var hostname = window.location.hostname;
+                            var domain = "";
+                            // 서브도메인이 있는 경우 도메인 설정 (예: app.example.com -> .example.com)
+                            if (hostname.split('.').length > 2) {{
+                                var parts = hostname.split('.');
+                                domain = "." + parts.slice(-2).join('.');
+                            }}
+                            
+                            // 쿠키 문자열 구성
+                            var cookieString = name + "=" + value + expires + "; path=/; SameSite=Lax";
+                            
+                            // 도메인 설정 (로컬호스트가 아닌 경우)
+                            if (domain && !hostname.includes('localhost') && !hostname.includes('127.0.0.1')) {{
+                                cookieString += "; domain=" + domain;
+                            }}
+                            
+                            // HTTPS 환경에서는 Secure 플래그 추가 (자동 감지)
+                            if (window.location.protocol === 'https:') {{
+                                cookieString += "; Secure";
+                            }}
+                            
+                            document.cookie = cookieString;
+                            console.log("Cookie set: " + name + "=" + value + " (domain: " + (domain || "default") + ")");
+                            
+                            // 쿠키 설정 확인 (여러 번 시도)
+                            var attempts = 0;
+                            var maxAttempts = 5;
+                            var checkInterval = setInterval(function() {{
+                                attempts++;
+                                var checkCookie = document.cookie.indexOf(name + "=");
+                                if (checkCookie >= 0) {{
+                                    console.log("Cookie check: OK (attempt " + attempts + ")");
+                                    clearInterval(checkInterval);
+                                }} else if (attempts >= maxAttempts) {{
+                                    console.log("Cookie check: FAILED after " + maxAttempts + " attempts");
+                                    clearInterval(checkInterval);
+                                }}
+                            }}, 100);
                         }}
-                        // 서버 환경 대응: Secure 플래그는 HTTPS에서만, SameSite 설정
-                        var cookieString = name + "=" + value + expires + "; path=/; SameSite=Lax";
-                        // HTTPS 환경에서는 Secure 플래그 추가 (자동 감지)
-                        if (window.location.protocol === 'https:') {{
-                            cookieString += "; Secure";
-                        }}
-                        document.cookie = cookieString;
-                        console.log("Cookie set: " + name + "=" + value);
-                        // 쿠키 설정 확인
-                        setTimeout(function() {{
-                            var checkCookie = document.cookie.indexOf(name + "=");
-                            console.log("Cookie check: " + (checkCookie >= 0 ? "OK" : "FAILED"));
-                        }}, 100);
-                    }}
-                    setCookie("auth_admin_id", "{admin_id}", 1);
+                        
+                        // 즉시 실행
+                        setCookie("auth_admin_id", "{admin_id}", 1);
+                    }})();
                     </script>
                     """
                     st.components.v1.html(cookie_script, height=0)
